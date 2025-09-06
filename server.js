@@ -1,11 +1,13 @@
 /**
  * WhatsApp Group Notifier API (RemoteAuth + MongoDB)
  *
- * ENV:
- *  - BOT_TOKEN        required   shared secret; clients send as body field "bot-token"
- *  - MONGO_URL        required   mongodb+srv://.../wa_remoteauth?...
- *  - PORT             optional   default 3000
- *  - WAPP_CLIENT_ID   optional   stable id for RemoteAuth session, default "ci-notifier"
+ * ENV
+ *  - BOT_TOKEN          required   shared secret; clients send as body field "bot-token"
+ *  - MONGO_URL          required   mongodb+srv://.../wa_remoteauth?...
+ *  - PORT               optional   default 3000
+ *  - WAPP_CLIENT_ID     optional   stable id for RemoteAuth session (default "ci-notifier")
+ *  - WA_BACKUP_MS       optional   enable ZIP backups every N ms (default: disabled)
+ *  - WA_BACKUP_DIR      optional   where to write the ZIP when WA_BACKUP_MS is set (default: /tmp)
  */
 
 import "dotenv/config";
@@ -16,9 +18,12 @@ import qrcode from "qrcode-terminal";
 import mongoose from "mongoose";
 import pkg from "whatsapp-web.js";
 import { MongoStore } from "wwebjs-mongo";
+import fs from "node:fs";
+import path from "node:path";
 
 const { Client, RemoteAuth } = pkg;
 
+// ----- Env & guards -----
 const PORT = Number(process.env.PORT || 3000);
 const BOT_TOKEN = process.env.BOT_TOKEN || "";
 const MONGO_URL = process.env.MONGO_URL || "";
@@ -29,26 +34,42 @@ if (!BOT_TOKEN || !MONGO_URL) {
   process.exit(1);
 }
 
+// Optional: backup settings (disabled unless WA_BACKUP_MS is provided)
+const BACKUP_MS = Number(process.env.WA_BACKUP_MS || 0);
+const BACKUP_DIR = process.env.WA_BACKUP_DIR || "/tmp";
+
+// If backups are enabled, ensure the directory is writable and switch CWD to it
+if (BACKUP_MS > 0) {
+  try {
+    fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    fs.accessSync(BACKUP_DIR, fs.constants.W_OK);
+    process.chdir(BACKUP_DIR);
+    console.log(`🗂️  Backup enabled; writing ZIPs to ${BACKUP_DIR} every ${BACKUP_MS}ms`);
+  } catch (e) {
+    console.warn(
+      `⚠️ Could not prepare backup directory "${BACKUP_DIR}" (${e?.message}). ` +
+      "Continuing without changing CWD; if backups fail, disable WA_BACKUP_MS or fix permissions."
+    );
+  }
+}
+
 // ----- MongoDB (RemoteAuth store) -----
 await mongoose.connect(MONGO_URL, {
-  // keep defaults sensible; dbName can be in the URI
   serverSelectionTimeoutMS: 15000,
 });
-const store = new MongoStore({
-  mongoose,
-  // keep this collection name stable so sessions persist where you expect
-  collectionName: "auth-data",
-});
+const store = new MongoStore({ mongoose });
 
 // ----- WhatsApp client (RemoteAuth) -----
 let isReady = false;
 
+// Build RemoteAuth options safely (no ZIP backup by default)
+const raOpts = { store, clientId: CLIENT_ID };
+if (BACKUP_MS > 0) {
+  raOpts.backupSyncIntervalMs = BACKUP_MS; // WhatsApp-web.js will create RemoteAuth-*.zip in CWD
+}
+
 const client = new Client({
-  authStrategy: new RemoteAuth({
-    store,
-    clientId: CLIENT_ID, // if this changes, you'll get a fresh session (QR again)
-    backupSyncIntervalMs: 300_000, // 5 min
-  }),
+  authStrategy: new RemoteAuth(raOpts),
   puppeteer: {
     headless: true,
     args: [
@@ -106,27 +127,41 @@ function requireBodyToken(req, res, next) {
 }
 
 app.get("/healthz", (_req, res) => {
-  res.json({ ok: true, ready: isReady });
+  res.json({
+    ok: true,
+    ready: isReady,
+    clientId: CLIENT_ID,
+    backupMs: BACKUP_MS || 0,
+    cwd: process.cwd(),
+  });
 });
 
 /**
  * POST /send-group
- * body: { group: "Group Name", message: "text", "bot-token": "..." }
+ * body: { group: "Group Name" | "groupId", message: "text", "bot-token": "..." }
  */
 app.post("/send-group", requireBodyToken, async (req, res) => {
   try {
     if (!isReady) return res.status(503).json({ error: "whatsapp not ready" });
 
-    const group = String(req.body?.group || "").trim();
+    const groupRaw = String(req.body?.group || "").trim();
     const message = String(req.body?.message || "").trim();
-    if (!group || !message) {
+    if (!groupRaw || !message) {
       return res.status(400).json({ error: "group and message are required" });
     }
 
     const chats = await client.getChats();
-    const g = chats.find(
-      (c) => c.isGroup && String(c.name || "").toLowerCase() === group.toLowerCase()
-    );
+
+    // allow either exact group id or case-insensitive name match
+    const groupLower = groupRaw.toLowerCase();
+    const g = chats.find((c) => {
+      if (!c.isGroup) return false;
+      const byId = c.id?._serialized === groupRaw;
+      const byName =
+        String(c.name || "").trim().toLowerCase() === groupLower;
+      return byId || byName;
+    });
+
     if (!g) return res.status(404).json({ error: "group not found" });
 
     await client.sendMessage(g.id._serialized, message);
@@ -146,7 +181,7 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, async () => {
     try {
       await client.destroy();
-    } catch (_) {}
+    } catch {}
     server.close(() => process.exit(0));
   });
 }
