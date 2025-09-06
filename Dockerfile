@@ -1,4 +1,3 @@
-# Small, prod-ready Node + Chromium for puppeteer
 FROM node:20-bookworm-slim
 
 ENV NODE_ENV=production \
@@ -10,8 +9,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY package*.json ./
-RUN npm ci --omit=dev
+
+# copy manifests only
+COPY package.json package-lock.json* ./
+
+# If lockfile exists, use `npm ci`; otherwise fall back to `npm install`
+RUN if [ -f package-lock.json ]; then \
+      npm ci --omit=dev --no-audit --no-fund; \
+    else \
+      npm install --omit=dev --no-audit --no-fund; \
+    fi
+
+# now copy the rest
 COPY . .
 
 EXPOSE 3000
