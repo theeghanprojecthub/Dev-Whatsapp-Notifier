@@ -1,0 +1,10 @@
+services:
+  whatsapp-group-api:
+    build: .
+    container_name: whatsapp-group-api
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    volumes:
+      - ./.wwebjs_auth:/app/.wwebjs_auth
