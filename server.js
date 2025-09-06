@@ -1,16 +1,17 @@
 /**
  * WhatsApp Group Notifier API (RemoteAuth + MongoDB)
  *
- * ENV
- *  - BOT_TOKEN          required   shared secret; clients send as body field "bot-token"
- *  - MONGO_URL          required   mongodb+srv://.../wa_remoteauth?...
- *  - PORT               optional   default 3000
- *  - WAPP_CLIENT_ID     optional   stable id for RemoteAuth session (default "ci-notifier")
- *  - WA_BACKUP_MS       optional   enable ZIP backups every N ms (default: disabled)
- *  - WA_BACKUP_DIR      optional   where to write the ZIP when WA_BACKUP_MS is set (default: /tmp)
+ * ENV:
+ *  - BOT_TOKEN        required  shared secret; clients send as body field "bot-token"
+ *  - MONGO_URL        required  mongodb+srv://.../wa_remoteauth?...
+ *  - PORT             optional  default 3000
+ *  - WAPP_CLIENT_ID   optional  stable id for RemoteAuth session, default "ci-notifier"
+ *  - WA_BACKUP_MS     optional  >=60000 enables RemoteAuth ZIP backup; anything <60000 disables
+ *  - WA_BACKUP_DIR    optional  directory for ZIPs when backup is enabled (default: /tmp)
  */
 
 import "dotenv/config";
+import fs from "node:fs";
 import express from "express";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
@@ -18,12 +19,9 @@ import qrcode from "qrcode-terminal";
 import mongoose from "mongoose";
 import pkg from "whatsapp-web.js";
 import { MongoStore } from "wwebjs-mongo";
-import fs from "node:fs";
-import path from "node:path";
 
 const { Client, RemoteAuth } = pkg;
 
-// ----- Env & guards -----
 const PORT = Number(process.env.PORT || 3000);
 const BOT_TOKEN = process.env.BOT_TOKEN || "";
 const MONGO_URL = process.env.MONGO_URL || "";
@@ -34,42 +32,44 @@ if (!BOT_TOKEN || !MONGO_URL) {
   process.exit(1);
 }
 
-// Optional: backup settings (disabled unless WA_BACKUP_MS is provided)
-const BACKUP_MS = Number(process.env.WA_BACKUP_MS || 0);
-const BACKUP_DIR = process.env.WA_BACKUP_DIR || "/tmp";
+// ----- MongoDB (RemoteAuth store) -----
+await mongoose.connect(MONGO_URL, { serverSelectionTimeoutMS: 15000 });
+const store = new MongoStore({
+  mongoose,
+  collectionName: "auth-data",
+});
 
-// If backups are enabled, ensure the directory is writable and switch CWD to it
-if (BACKUP_MS > 0) {
-  try {
-    fs.mkdirSync(BACKUP_DIR, { recursive: true });
-    fs.accessSync(BACKUP_DIR, fs.constants.W_OK);
-    process.chdir(BACKUP_DIR);
-    console.log(`🗂️  Backup enabled; writing ZIPs to ${BACKUP_DIR} every ${BACKUP_MS}ms`);
-  } catch (e) {
-    console.warn(
-      `⚠️ Could not prepare backup directory "${BACKUP_DIR}" (${e?.message}). ` +
-      "Continuing without changing CWD; if backups fail, disable WA_BACKUP_MS or fix permissions."
-    );
+// ----- Backup / ZIP safety (CI friendly) -----
+const BACKUP_MS_ENV = process.env.WA_BACKUP_MS;
+const BACKUP_DIR = process.env.WA_BACKUP_DIR || "/tmp";
+let backupSyncIntervalMs = undefined;
+
+if (BACKUP_MS_ENV) {
+  const n = Number(BACKUP_MS_ENV);
+  if (Number.isFinite(n) && n >= 60000) {
+    backupSyncIntervalMs = n;
+    try {
+      await fs.promises.mkdir(BACKUP_DIR, { recursive: true });
+      // Put ZIPs in a writable place on CI
+      process.chdir(BACKUP_DIR);
+    } catch (e) {
+      console.warn("⚠️ Could not prepare backup dir:", e);
+    }
+    console.log(`🗂️  Backup enabled; writing ZIPs to ${BACKUP_DIR} every ${backupSyncIntervalMs}ms`);
+  } else {
+    console.log("ℹ️  WA_BACKUP_MS provided but <60000; backup disabled.");
   }
 }
 
-// ----- MongoDB (RemoteAuth store) -----
-await mongoose.connect(MONGO_URL, {
-  serverSelectionTimeoutMS: 15000,
-});
-const store = new MongoStore({ mongoose });
-
-// ----- WhatsApp client (RemoteAuth) -----
 let isReady = false;
 
-// Build RemoteAuth options safely (no ZIP backup by default)
-const raOpts = { store, clientId: CLIENT_ID };
-if (BACKUP_MS > 0) {
-  raOpts.backupSyncIntervalMs = BACKUP_MS; // WhatsApp-web.js will create RemoteAuth-*.zip in CWD
-}
-
+// ----- WhatsApp client (RemoteAuth) -----
 const client = new Client({
-  authStrategy: new RemoteAuth(raOpts),
+  authStrategy: new RemoteAuth({
+    store,
+    clientId: CLIENT_ID,                // keep this stable to reuse session
+    backupSyncIntervalMs,               // undefined = no ZIP backup
+  }),
   puppeteer: {
     headless: true,
     args: [
@@ -84,29 +84,19 @@ const client = new Client({
 });
 
 client.on("qr", (qr) => {
-  // Shown only on first link or when session is invalid/missing
   console.log("📲 Scan this QR to link the bot number:");
   qrcode.generate(qr, { small: true });
 });
-
-client.on("remote_session_saved", () => {
-  console.log("💾 Remote session saved to MongoDB.");
-});
-
-client.on("authenticated", () => {
-  console.log("🔐 Authenticated.");
-});
-
+client.on("remote_session_saved", () => console.log("💾 Remote session saved to MongoDB."));
+client.on("authenticated", () => console.log("🔐 Authenticated."));
 client.on("ready", () => {
   isReady = true;
   console.log("✅ WhatsApp client ready");
 });
-
 client.on("disconnected", (reason) => {
   isReady = false;
   console.error("❌ WhatsApp client disconnected:", reason);
 });
-
 client.on("auth_failure", (m) => {
   isReady = false;
   console.error("🚫 Authentication failure:", m);
@@ -127,48 +117,68 @@ function requireBodyToken(req, res, next) {
 }
 
 app.get("/healthz", (_req, res) => {
-  res.json({
-    ok: true,
-    ready: isReady,
-    clientId: CLIENT_ID,
-    backupMs: BACKUP_MS || 0,
-    cwd: process.cwd(),
-  });
+  res.json({ ok: true, ready: isReady });
 });
 
 /**
  * POST /send-group
- * body: { group: "Group Name" | "groupId", message: "text", "bot-token": "..." }
+ * body: { group?: "Group Name", groupId?: "1203...@g.us", message: "text", "bot-token": "..." }
+ *
+ * - Prefers groupId when provided (no ambiguity).
+ * - Waits for server ack (>=1) up to 10s before responding.
  */
 app.post("/send-group", requireBodyToken, async (req, res) => {
   try {
     if (!isReady) return res.status(503).json({ error: "whatsapp not ready" });
 
-    const groupRaw = String(req.body?.group || "").trim();
+    const groupName = String(req.body?.group || "").trim();
+    const groupIdReq = String(req.body?.groupId || "").trim();
     const message = String(req.body?.message || "").trim();
-    if (!groupRaw || !message) {
-      return res.status(400).json({ error: "group and message are required" });
+    if ((!groupName && !groupIdReq) || !message) {
+      return res.status(400).json({ error: "provide group or groupId and a message" });
     }
 
-    const chats = await client.getChats();
+    let chat;
+    if (groupIdReq) {
+      try {
+        chat = await client.getChatById(groupIdReq);
+      } catch {
+        return res.status(404).json({ error: "groupId not found" });
+      }
+      if (!chat?.isGroup) return res.status(400).json({ error: "groupId is not a group" });
+    } else {
+      const chats = await client.getChats();
+      chat = chats.find(
+        (c) => c.isGroup && String(c.name || "").toLowerCase() === groupName.toLowerCase()
+      );
+      if (!chat) return res.status(404).json({ error: "group not found" });
+    }
 
-    // allow either exact group id or case-insensitive name match
-    const groupLower = groupRaw.toLowerCase();
-    const g = chats.find((c) => {
-      if (!c.isGroup) return false;
-      const byId = c.id?._serialized === groupRaw;
-      const byName =
-        String(c.name || "").trim().toLowerCase() === groupLower;
-      return byId || byName;
+    // Send and wait for server ack (<=10s)
+    const sent = await client.sendMessage(chat.id._serialized, message);
+    const acked = await new Promise((resolve) => {
+      const timeout = setTimeout(() => resolve(false), 10000);
+      const onAck = (msg, ack) => {
+        if (msg.id._serialized === sent.id._serialized && ack >= 1) {
+          clearTimeout(timeout);
+          client.removeListener("message_ack", onAck);
+          resolve(true);
+        }
+      };
+      client.on("message_ack", onAck);
     });
 
-    if (!g) return res.status(404).json({ error: "group not found" });
+    console.log(`📨 Sent to ${chat.id._serialized}, ack=${acked ? "server" : "timeout"}`);
 
-    await client.sendMessage(g.id._serialized, message);
-    res.json({ ok: true, groupId: g.id._serialized });
-  } catch (err) {
-    console.error("Error in /send-group:", err);
-    res.status(500).json({ error: "send failed" });
+    return res.json({
+      ok: true,
+      groupId: chat.id._serialized,
+      messageId: sent.id._serialized,
+      ack: acked ? "server" : "pending",
+    });
+  } catch (e) {
+    console.error("Error in /send-group:", e);
+    return res.status(500).json({ error: "send failed" });
   }
 });
 
@@ -186,9 +196,5 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
   });
 }
 
-process.on("unhandledRejection", (err) => {
-  console.error("UNHANDLED REJECTION:", err);
-});
-process.on("uncaughtException", (err) => {
-  console.error("UNCAUGHT EXCEPTION:", err);
-});
+process.on("unhandledRejection", (err) => console.error("UNHANDLED REJECTION:", err));
+process.on("uncaughtException",  (err) => console.error("UNCAUGHT EXCEPTION:", err));
